@@ -79,6 +79,7 @@ static bool is_item_managed(struct move_source_switcher_info *filter, obs_scenei
 struct adjust_vis_data {
 	struct move_source_switcher_info *filter;
 	obs_source_t *active_source;
+	obs_data_t *settings;
 };
 
 static bool adjust_wrapper_item_vis(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
@@ -93,10 +94,7 @@ static bool adjust_wrapper_item_vis(obs_scene_t *scene, obs_sceneitem_t *item, v
 	if (!name || !strlen(name))
 		return true;
 
-	obs_data_t *settings = obs_source_get_settings(data->filter->filter_source);
-	bool checked = obs_data_get_bool(settings, name);
-	obs_data_release(settings);
-
+	bool checked = obs_data_get_bool(data->settings, name);
 	bool managed = (data->filter->mode == FILTER_MODE_INCLUDE) ? checked : !checked;
 	if (managed) {
 		bool is_active = (data->active_source && source == data->active_source);
@@ -122,11 +120,14 @@ static obs_source_t *create_wrapper_scene(obs_source_t *parent_source, struct mo
 		return NULL;
 
 	obs_source_t *active_source = active_item ? obs_sceneitem_get_source(active_item) : NULL;
+	obs_data_t *settings = obs_source_get_settings(filter->filter_source);
 	struct adjust_vis_data data = {
 		.filter = filter,
 		.active_source = active_source,
+		.settings = settings,
 	};
 	obs_scene_enum_items(dup_scene, adjust_wrapper_item_vis, &data);
+	obs_data_release(settings);
 
 	return obs_scene_get_source(dup_scene);
 }
@@ -197,6 +198,13 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 	filter->wrapper_scene_a = create_wrapper_scene(parent, filter, from_item);
 	filter->wrapper_scene_b = create_wrapper_scene(parent, filter, to_item);
 
+	if (!filter->wrapper_scene_a || !filter->wrapper_scene_b) {
+		clean_wrapper_scenes(filter);
+		filter->sceneitem_a = NULL;
+		filter->sceneitem_b = NULL;
+		return;
+	}
+
 	obs_transition_set(filter->move_transition, filter->wrapper_scene_a);
 	obs_transition_start(filter->move_transition, OBS_TRANSITION_MODE_AUTO, filter->duration, filter->wrapper_scene_b);
 
@@ -235,6 +243,36 @@ static void on_item_visible(void *data, calldata_t *calldata)
 		if (item == filter->current_active_item && !filter->transitioning) {
 			filter->current_active_item = NULL;
 		}
+	}
+}
+
+static void on_item_add(void *data, calldata_t *calldata)
+{
+	struct move_source_switcher_info *filter = data;
+	obs_sceneitem_t *item = (obs_sceneitem_t *)calldata_ptr(calldata, "item");
+	if (!item)
+		return;
+
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (!source)
+		return;
+
+	const char *name = obs_source_get_name(source);
+	if (!name || !strlen(name))
+		return;
+
+	obs_data_t *settings = obs_source_get_settings(filter->filter_source);
+	bool checked = obs_data_get_bool(settings, name);
+	obs_data_release(settings);
+
+	bool managed = (filter->mode == FILTER_MODE_INCLUDE) ? checked : !checked;
+	if (managed) {
+		int64_t id = obs_sceneitem_get_id(item);
+		for (size_t i = 0; i < filter->managed_item_ids.num; i++) {
+			if (filter->managed_item_ids.array[i] == id)
+				return;
+		}
+		da_push_back(filter->managed_item_ids, &id);
 	}
 }
 
@@ -309,6 +347,7 @@ static void on_parent_destroy(void *data, calldata_t *calldata)
 static void disconnect_parent_signals(struct move_source_switcher_info *filter)
 {
 	if (filter->connected_scene_signals) {
+		signal_handler_disconnect(filter->connected_scene_signals, "item_add", on_item_add, filter);
 		signal_handler_disconnect(filter->connected_scene_signals, "item_visible", on_item_visible, filter);
 		signal_handler_disconnect(filter->connected_scene_signals, "item_remove", on_item_remove, filter);
 		signal_handler_disconnect(filter->connected_scene_signals, "remove", on_parent_destroy, filter);
@@ -320,8 +359,10 @@ static void disconnect_parent_signals(struct move_source_switcher_info *filter)
 static void connect_parent_signals(struct move_source_switcher_info *filter)
 {
 	obs_source_t *parent = obs_filter_get_parent(filter->filter_source);
-	if (!parent)
+	if (!parent) {
+		disconnect_parent_signals(filter);
 		return;
+	}
 
 	signal_handler_t *sh = obs_source_get_signal_handler(parent);
 	if (sh == filter->connected_scene_signals)
@@ -330,6 +371,7 @@ static void connect_parent_signals(struct move_source_switcher_info *filter)
 	disconnect_parent_signals(filter);
 
 	if (sh) {
+		signal_handler_connect(sh, "item_add", on_item_add, filter);
 		signal_handler_connect(sh, "item_visible", on_item_visible, filter);
 		signal_handler_connect(sh, "item_remove", on_item_remove, filter);
 		signal_handler_connect(sh, "remove", on_parent_destroy, filter);

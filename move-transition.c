@@ -3350,6 +3350,7 @@ extern struct obs_source_info move_audio_value_filter;
 extern struct obs_source_info audio_move_filter;
 extern struct obs_source_info move_action_filter;
 extern struct obs_source_info move_audio_action_filter;
+extern struct obs_source_info move_source_switcher_filter;
 #ifdef WIN32
 extern struct obs_source_info nvidia_move_filter;
 extern bool load_nvar(void);
@@ -3490,6 +3491,7 @@ bool obs_module_load(void)
 	obs_register_source(&audio_move_filter);
 	obs_register_source(&move_action_filter);
 	obs_register_source(&move_audio_action_filter);
+	obs_register_source(&move_source_switcher_filter);
 #ifdef WIN32
 	if (load_nvar())
 		obs_register_source(&nvidia_move_filter);

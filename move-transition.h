@@ -12,6 +12,7 @@
 #define MOVE_ACTION_FILTER_ID "move_action_filter"
 #define MOVE_AUDIO_ACTION_FILTER_ID "move_audio_action_filter"
 #define MOVE_DIRECTSHOW_FILTER_ID "move_directshow_filter"
+#define MOVE_SOURCE_SWITCHER_FILTER_ID "move_source_switcher_filter"
 
 #define PLUGIN_INFO                                                                                                     \
 	"<a href=\"https://obsproject.com/forum/resources/move-transition.913/\">Move Transition</a> (" PROJECT_VERSION \

@@ -34,7 +34,8 @@ bool is_move_filter(const char *filter_id)
 	return strcmp(filter_id, MOVE_SOURCE_FILTER_ID) == 0 || strcmp(filter_id, MOVE_SOURCE_SWAP_FILTER_ID) == 0 ||
 	       strcmp(filter_id, MOVE_VALUE_FILTER_ID) == 0 || strcmp(filter_id, MOVE_AUDIO_VALUE_FILTER_ID) == 0 ||
 	       strcmp(filter_id, MOVE_ACTION_FILTER_ID) == 0 || strcmp(filter_id, MOVE_AUDIO_ACTION_FILTER_ID) == 0 ||
-	       strcmp(filter_id, MOVE_DIRECTSHOW_FILTER_ID) == 0;
+	       strcmp(filter_id, MOVE_DIRECTSHOW_FILTER_ID) == 0 ||
+	       strcmp(filter_id, MOVE_SOURCE_SWITCHER_FILTER_ID) == 0;
 }
 
 void move_filter_init(struct move_filter *move_filter, obs_source_t *source, void (*move_start)(void *data))

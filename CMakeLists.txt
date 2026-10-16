@@ -50,6 +50,7 @@ target_sources(${PROJECT_NAME} PRIVATE
 	move-source-swap-filter.c
 	move-value-filter.c
 	move-action-filter.c
+	move-source-switcher-filter.c
 	audio-move.c
 	easing.c
 	move-transition.h

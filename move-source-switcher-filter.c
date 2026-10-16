@@ -11,14 +11,14 @@ enum filter_mode {
 };
 
 struct move_source_switcher_info {
-	obs_source_t *source;
-	obs_source_t *transition;
+	obs_source_t *filter_source;
+	obs_source_t *move_transition;
 	obs_source_t *wrapper_scene_a;
 	obs_source_t *wrapper_scene_b;
 
 	obs_sceneitem_t *current_active_item;
-	obs_sceneitem_t *outgoing_item;
-	obs_sceneitem_t *incoming_item;
+	obs_sceneitem_t *sceneitem_a;
+	obs_sceneitem_t *sceneitem_b;
 
 	bool transitioning;
 	int internal_visibility_change;
@@ -35,9 +35,8 @@ struct move_source_switcher_info {
 	uint32_t switch_percentage;
 
 	signal_handler_t *connected_scene_signals;
-	obs_source_t *parent_scene_source;
 
-	DARRAY(char *) managed_source_names;
+	DARRAY(int64_t) managed_item_ids;
 };
 
 static const char *move_source_switcher_get_name(void *type_data)
@@ -60,38 +59,98 @@ static void clean_wrapper_scenes(struct move_source_switcher_info *filter)
 
 static void free_managed_sources(struct move_source_switcher_info *filter)
 {
-	for (size_t i = 0; i < filter->managed_source_names.num; i++) {
-		bfree(filter->managed_source_names.array[i]);
-	}
-	da_free(filter->managed_source_names);
-	da_init(filter->managed_source_names);
+	da_free(filter->managed_item_ids);
+	da_init(filter->managed_item_ids);
 }
 
 static bool is_item_managed(struct move_source_switcher_info *filter, obs_sceneitem_t *item)
 {
 	if (!item)
 		return false;
-	obs_source_t *source = obs_sceneitem_get_source(item);
-	if (!source)
-		return false;
-	const char *name = obs_source_get_name(source);
-	if (!name || !strlen(name))
-		return false;
 
-	for (size_t i = 0; i < filter->managed_source_names.num; i++) {
-		if (strcmp(filter->managed_source_names.array[i], name) == 0)
+	int64_t id = obs_sceneitem_get_id(item);
+	for (size_t i = 0; i < filter->managed_item_ids.num; i++) {
+		if (filter->managed_item_ids.array[i] == id)
 			return true;
 	}
 	return false;
 }
 
-static obs_source_t *create_wrapper_scene(obs_source_t *parent_scene, obs_sceneitem_t *item)
+struct clone_scene_data {
+	obs_scene_t *target_scene;
+	struct move_source_switcher_info *filter;
+	obs_sceneitem_t *active_switcher_item;
+};
+
+static void copy_sceneitem_properties(obs_sceneitem_t *dst, obs_sceneitem_t *src)
+{
+	struct vec2 pos, scale, bounds;
+	struct obs_sceneitem_crop crop;
+	obs_sceneitem_get_pos(src, &pos);
+	obs_sceneitem_get_scale(src, &scale);
+	obs_sceneitem_get_bounds(src, &bounds);
+	obs_sceneitem_get_crop(src, &crop);
+	float rot = obs_sceneitem_get_rot(src);
+	uint32_t align = obs_sceneitem_get_alignment(src);
+	enum obs_bounds_type bounds_type = obs_sceneitem_get_bounds_type(src);
+	uint32_t bounds_align = obs_sceneitem_get_bounds_alignment(src);
+	enum obs_blending_mode blend_mode = obs_sceneitem_get_blending_mode(src);
+	enum obs_blending_method blend_method = obs_sceneitem_get_blending_method(src);
+
+	obs_sceneitem_set_alignment(dst, align);
+	obs_sceneitem_set_bounds_type(dst, bounds_type);
+	obs_sceneitem_set_bounds_alignment(dst, bounds_align);
+	obs_sceneitem_set_bounds(dst, &bounds);
+	obs_sceneitem_set_pos(dst, &pos);
+	obs_sceneitem_set_scale(dst, &scale);
+	obs_sceneitem_set_rot(dst, rot);
+	obs_sceneitem_set_crop(dst, &crop);
+	obs_sceneitem_set_blending_mode(dst, blend_mode);
+	obs_sceneitem_set_blending_method(dst, blend_method);
+}
+
+static bool clone_item_to_wrapper(obs_scene_t *parent_scene, obs_sceneitem_t *item, void *param)
+{
+	UNUSED_PARAMETER(parent_scene);
+	struct clone_scene_data *data = param;
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (!source)
+		return true;
+
+	obs_sceneitem_t *new_item = obs_scene_add(data->target_scene, source);
+	if (!new_item)
+		return true;
+
+	copy_sceneitem_properties(new_item, item);
+
+	if (is_item_managed(data->filter, item)) {
+		/* Switcher item: only visible if it matches the designated active item for this wrapper */
+		bool is_active = (item == data->active_switcher_item);
+		obs_sceneitem_set_visible(new_item, is_active);
+	} else {
+		/* Non-switcher item (background, chat, overlay): keep parent scene's visibility */
+		obs_sceneitem_set_visible(new_item, obs_sceneitem_visible(item));
+	}
+	return true;
+}
+
+static obs_source_t *create_wrapper_scene(obs_source_t *parent_scene, struct move_source_switcher_info *filter,
+					  obs_sceneitem_t *active_item)
 {
 	if (!parent_scene)
 		return NULL;
 
-	uint32_t width = obs_source_get_width(parent_scene);
-	uint32_t height = obs_source_get_height(parent_scene);
+	uint32_t width = 0;
+	uint32_t height = 0;
+	struct obs_video_info ovi;
+	if (obs_get_video_info(&ovi)) {
+		width = ovi.base_width;
+		height = ovi.base_height;
+	}
+	if (!width || !height) {
+		width = obs_source_get_width(parent_scene);
+		height = obs_source_get_height(parent_scene);
+	}
 	if (!width)
 		width = 1920;
 	if (!height)
@@ -108,35 +167,18 @@ static obs_source_t *create_wrapper_scene(obs_source_t *parent_scene, obs_scenei
 	if (!scene_source)
 		return NULL;
 
-	if (!item)
-		return scene_source;
+	obs_scene_t *target_scene = obs_scene_from_source(scene_source);
+	obs_scene_t *parent_scene_obj = obs_scene_from_source(parent_scene);
+	if (!parent_scene_obj)
+		parent_scene_obj = obs_group_from_source(parent_scene);
 
-	obs_scene_t *scene = obs_scene_from_source(scene_source);
-	obs_source_t *source = obs_sceneitem_get_source(item);
-	if (!scene || !source)
-		return scene_source;
-
-	obs_sceneitem_t *new_item = obs_scene_add(scene, source);
-	if (new_item) {
-		struct vec2 pos, scale, bounds;
-		struct obs_sceneitem_crop crop;
-		obs_sceneitem_get_pos(item, &pos);
-		obs_sceneitem_get_scale(item, &scale);
-		obs_sceneitem_get_bounds(item, &bounds);
-		obs_sceneitem_get_crop(item, &crop);
-		float rot = obs_sceneitem_get_rot(item);
-		uint32_t align = obs_sceneitem_get_alignment(item);
-		enum obs_bounds_type bounds_type = obs_sceneitem_get_bounds_type(item);
-		uint32_t bounds_align = obs_sceneitem_get_bounds_alignment(item);
-
-		obs_sceneitem_set_pos(new_item, &pos);
-		obs_sceneitem_set_scale(new_item, &scale);
-		obs_sceneitem_set_rot(new_item, rot);
-		obs_sceneitem_set_crop(new_item, &crop);
-		obs_sceneitem_set_alignment(new_item, align);
-		obs_sceneitem_set_bounds_type(new_item, bounds_type);
-		obs_sceneitem_set_bounds_alignment(new_item, bounds_align);
-		obs_sceneitem_set_bounds(new_item, &bounds);
+	if (target_scene && parent_scene_obj) {
+		struct clone_scene_data csd = {
+			.target_scene = target_scene,
+			.filter = filter,
+			.active_switcher_item = active_item,
+		};
+		obs_scene_enum_items(parent_scene_obj, clone_item_to_wrapper, &csd);
 	}
 
 	return scene_source;
@@ -153,21 +195,21 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 	if (!source_b)
 		return;
 
-	/* 3.3 Identical source collision */
+	/* Identical source collision */
 	if (source_a && source_a == source_b) {
 		filter->current_active_item = to_item;
 		return;
 	}
 
-	if (!filter->transition) {
+	if (!filter->move_transition) {
 		obs_data_t *settings = obs_data_create();
-		filter->transition = obs_source_create_private("move_transition", "internal_move_switcher", settings);
+		filter->move_transition = obs_source_create_private("move_transition", "internal_move_switcher", settings);
 		obs_data_release(settings);
 	}
-	if (!filter->transition)
+	if (!filter->move_transition)
 		return;
 
-	obs_data_t *s = obs_source_get_settings(filter->transition);
+	obs_data_t *s = obs_source_get_settings(filter->move_transition);
 	obs_data_set_int(s, S_EASING_MATCH, filter->easing);
 	obs_data_set_int(s, S_EASING_FUNCTION_MATCH, filter->easing_function);
 	obs_data_set_double(s, S_CURVE_MATCH, filter->curve);
@@ -176,22 +218,22 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 	obs_data_set_bool(s, S_NAME_NUMBER_MATCH, filter->name_number_match);
 	obs_data_set_bool(s, S_NAME_LAST_WORD_MATCH, filter->name_last_word_match);
 	obs_data_set_int(s, S_SWITCH_PERCENTAGE, (long long)filter->switch_percentage);
-	obs_source_update(filter->transition, s);
+	obs_source_update(filter->move_transition, s);
 	obs_data_release(s);
 
-	/* 2.3 Rapid switching: stop previous transition cleanly */
+	/* Rapid switching: stop previous transition cleanly */
 	if (filter->transitioning) {
-		obs_transition_force_stop(filter->transition);
-		obs_transition_clear(filter->transition);
+		obs_transition_force_stop(filter->move_transition);
+		obs_transition_clear(filter->move_transition);
 		clean_wrapper_scenes(filter);
 		filter->transitioning = false;
 	}
 
-	obs_source_t *parent = filter->parent_scene_source ? filter->parent_scene_source : obs_filter_get_parent(filter->source);
+	obs_source_t *parent = obs_filter_get_parent(filter->filter_source);
 	if (!parent)
 		return;
 
-	/* 3.1 "First Show" handling: if from_item is NULL and duration is 0, hard cut */
+	/* First Show handling: if from_item is NULL and duration is 0, hard cut */
 	if (!from_item && filter->duration == 0) {
 		filter->current_active_item = to_item;
 		filter->internal_visibility_change++;
@@ -200,30 +242,26 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 		return;
 	}
 
-	/* 1.3 Transform preservation via scene wrappers */
-	filter->wrapper_scene_a = create_wrapper_scene(parent, from_item);
-	filter->wrapper_scene_b = create_wrapper_scene(parent, to_item);
+	filter->sceneitem_a = from_item;
+	filter->sceneitem_b = to_item;
 
-	obs_transition_set(filter->transition, filter->wrapper_scene_a);
-	obs_transition_start(filter->transition, OBS_TRANSITION_MODE_AUTO, filter->duration, filter->wrapper_scene_b);
+	/* Create wrapper scenes reproducing the full parent scene:
+	 * Wrapper A has from_item visible; Wrapper B has to_item visible */
+	filter->wrapper_scene_a = create_wrapper_scene(parent, filter, from_item);
+	filter->wrapper_scene_b = create_wrapper_scene(parent, filter, to_item);
 
-	filter->outgoing_item = from_item;
-	filter->incoming_item = to_item;
+	obs_transition_set(filter->move_transition, filter->wrapper_scene_a);
+	obs_transition_start(filter->move_transition, OBS_TRANSITION_MODE_AUTO, filter->duration, filter->wrapper_scene_b);
+
 	filter->transitioning = true;
 
-	/* 3.2 UI Eye-Icon Flicker fix: Turn off previous item, keep new item checked */
-	filter->internal_visibility_change++;
-	if (from_item && from_item != to_item) {
-		obs_sceneitem_set_visible(from_item, false);
-	}
-	obs_sceneitem_set_visible(to_item, true);
-	filter->internal_visibility_change--;
+	/* Note: In OBS UI, both eye icons stay visible throughout the transition.
+	 * from_item will be turned off when the transition completes in video_tick. */
 }
 
 static void on_item_visible(void *data, calldata_t *calldata)
 {
 	struct move_source_switcher_info *filter = data;
-	/* 2.2 Reentrancy guard */
 	if (filter->internal_visibility_change > 0)
 		return;
 
@@ -240,9 +278,9 @@ static void on_item_visible(void *data, calldata_t *calldata)
 			return;
 
 		obs_sceneitem_t *from_item = filter->current_active_item;
-		/* 2.3 Rapid switching: transition from current incoming target */
-		if (filter->transitioning && filter->incoming_item) {
-			from_item = filter->incoming_item;
+		/* Rapid switching: transition from current incoming target */
+		if (filter->transitioning && filter->sceneitem_b) {
+			from_item = filter->sceneitem_b;
 		}
 
 		start_switcher_transition(filter, from_item, item);
@@ -262,38 +300,42 @@ static void on_item_remove(void *data, calldata_t *calldata)
 
 	if (item == filter->current_active_item)
 		filter->current_active_item = NULL;
-	if (item == filter->outgoing_item)
-		filter->outgoing_item = NULL;
-	if (item == filter->incoming_item) {
-		filter->incoming_item = NULL;
-		/* 1.4 Lifetime hazard: if target is removed during transition, abort */
-		if (filter->transitioning && filter->transition) {
-			obs_transition_force_stop(filter->transition);
-			obs_transition_clear(filter->transition);
+	if (item == filter->sceneitem_a)
+		filter->sceneitem_a = NULL;
+	if (item == filter->sceneitem_b) {
+		filter->sceneitem_b = NULL;
+		if (filter->transitioning && filter->move_transition) {
+			obs_transition_force_stop(filter->move_transition);
+			obs_transition_clear(filter->move_transition);
 			clean_wrapper_scenes(filter);
 			filter->transitioning = false;
 		}
 	}
-}
 
-static void move_source_switcher_update(void *data, obs_data_t *settings);
+	int64_t id = obs_sceneitem_get_id(item);
+	for (size_t i = 0; i < filter->managed_item_ids.num; i++) {
+		if (filter->managed_item_ids.array[i] == id) {
+			da_erase(filter->managed_item_ids, i);
+			break;
+		}
+	}
+}
 
 static void on_source_rename(void *data, calldata_t *calldata)
 {
 	struct move_source_switcher_info *filter = data;
 	const char *new_name = calldata_string(calldata, "new_name");
 	const char *prev_name = calldata_string(calldata, "prev_name");
-	if (!new_name || !prev_name || !filter->source)
+	if (!new_name || !prev_name || !filter->filter_source)
 		return;
 
-	/* 4.2 Save and persist updated settings on source rename */
-	obs_data_t *settings = obs_source_get_settings(filter->source);
+	/* Save and persist updated settings on source rename without recursive source_update */
+	obs_data_t *settings = obs_source_get_settings(filter->filter_source);
 	if (settings) {
 		if (obs_data_has_user_value(settings, prev_name)) {
 			bool val = obs_data_get_bool(settings, prev_name);
 			obs_data_erase(settings, prev_name);
 			obs_data_set_bool(settings, new_name, val);
-			obs_source_update(filter->source, settings);
 		}
 		obs_data_release(settings);
 	}
@@ -305,16 +347,16 @@ static void on_parent_destroy(void *data, calldata_t *calldata)
 {
 	UNUSED_PARAMETER(calldata);
 	struct move_source_switcher_info *filter = data;
-	if (filter->transitioning && filter->transition) {
-		obs_transition_force_stop(filter->transition);
-		obs_transition_clear(filter->transition);
+	if (filter->transitioning && filter->move_transition) {
+		obs_transition_force_stop(filter->move_transition);
+		obs_transition_clear(filter->move_transition);
 		clean_wrapper_scenes(filter);
 		filter->transitioning = false;
 	}
 	disconnect_parent_signals(filter);
 	filter->current_active_item = NULL;
-	filter->outgoing_item = NULL;
-	filter->incoming_item = NULL;
+	filter->sceneitem_a = NULL;
+	filter->sceneitem_b = NULL;
 }
 
 static void disconnect_parent_signals(struct move_source_switcher_info *filter)
@@ -326,28 +368,26 @@ static void disconnect_parent_signals(struct move_source_switcher_info *filter)
 		signal_handler_disconnect(filter->connected_scene_signals, "destroy", on_parent_destroy, filter);
 		filter->connected_scene_signals = NULL;
 	}
-	filter->parent_scene_source = NULL;
 }
 
 static void connect_parent_signals(struct move_source_switcher_info *filter)
 {
-	obs_source_t *parent = obs_filter_get_parent(filter->source);
+	obs_source_t *parent = obs_filter_get_parent(filter->filter_source);
 	if (!parent)
 		return;
 
-	if (filter->parent_scene_source == parent && filter->connected_scene_signals)
+	signal_handler_t *sh = obs_source_get_signal_handler(parent);
+	if (sh == filter->connected_scene_signals)
 		return;
 
 	disconnect_parent_signals(filter);
 
-	signal_handler_t *sh = obs_source_get_signal_handler(parent);
 	if (sh) {
 		signal_handler_connect(sh, "item_visible", on_item_visible, filter);
 		signal_handler_connect(sh, "item_remove", on_item_remove, filter);
 		signal_handler_connect(sh, "remove", on_parent_destroy, filter);
 		signal_handler_connect(sh, "destroy", on_parent_destroy, filter);
 		filter->connected_scene_signals = sh;
-		filter->parent_scene_source = parent;
 	}
 }
 
@@ -362,14 +402,14 @@ static bool cache_managed_items(obs_scene_t *scene, obs_sceneitem_t *item, void 
 	if (!name || !strlen(name))
 		return true;
 
-	obs_data_t *settings = obs_source_get_settings(filter->source);
+	obs_data_t *settings = obs_source_get_settings(filter->filter_source);
 	bool checked = obs_data_get_bool(settings, name);
 	obs_data_release(settings);
 
 	bool managed = (filter->mode == FILTER_MODE_INCLUDE) ? checked : !checked;
 	if (managed) {
-		char *name_copy = bstrdup(name);
-		da_push_back(filter->managed_source_names, &name_copy);
+		int64_t id = obs_sceneitem_get_id(item);
+		da_push_back(filter->managed_item_ids, &id);
 	}
 	return true;
 }
@@ -377,11 +417,11 @@ static bool cache_managed_items(obs_scene_t *scene, obs_sceneitem_t *item, void 
 static void *move_source_switcher_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct move_source_switcher_info *filter = bzalloc(sizeof(struct move_source_switcher_info));
-	filter->source = source;
-	da_init(filter->managed_source_names);
+	filter->filter_source = source;
+	da_init(filter->managed_item_ids);
 
 	obs_data_t *trans_settings = obs_data_create();
-	filter->transition = obs_source_create_private("move_transition", "internal_move_switcher", trans_settings);
+	filter->move_transition = obs_source_create_private("move_transition", "internal_move_switcher", trans_settings);
 	obs_data_release(trans_settings);
 
 	signal_handler_connect(obs_get_signal_handler(), "source_rename", on_source_rename, filter);
@@ -397,11 +437,11 @@ static void move_source_switcher_destroy(void *data)
 	signal_handler_disconnect(obs_get_signal_handler(), "source_rename", on_source_rename, filter);
 	disconnect_parent_signals(filter);
 
-	if (filter->transition) {
-		obs_transition_force_stop(filter->transition);
-		obs_transition_clear(filter->transition);
-		obs_source_release(filter->transition);
-		filter->transition = NULL;
+	if (filter->move_transition) {
+		obs_transition_force_stop(filter->move_transition);
+		obs_transition_clear(filter->move_transition);
+		obs_source_release(filter->move_transition);
+		filter->move_transition = NULL;
 	}
 
 	clean_wrapper_scenes(filter);
@@ -415,11 +455,15 @@ static void move_source_switcher_video_render(void *data, gs_effect_t *effect)
 	UNUSED_PARAMETER(effect);
 	struct move_source_switcher_info *filter = data;
 
-	/* 1.2 Fix: always render scene underneath so background/overlays are preserved */
-	obs_source_skip_video_filter(filter->source);
-
-	if (filter->transitioning && filter->transition) {
-		obs_source_video_render(filter->transition);
+	if (filter->transitioning && filter->move_transition) {
+		/* HIJACK PASS:
+		 * The move transition renders the full scene composite (wrapper_scene_a -> wrapper_scene_b).
+		 * We do NOT call obs_source_skip_video_filter to completely eliminate double rendering / ghosting. */
+		obs_source_video_render(filter->move_transition);
+	} else {
+		/* NORMAL PASS:
+		 * No transition active. Parent scene renders normally. */
+		obs_source_skip_video_filter(filter->filter_source);
 	}
 }
 
@@ -428,37 +472,32 @@ static void move_source_switcher_tick(void *data, float seconds)
 	UNUSED_PARAMETER(seconds);
 	struct move_source_switcher_info *filter = data;
 
-	/* 1.1 Fix: lazily connect parent signals if not yet connected */
 	if (!filter->connected_scene_signals) {
 		connect_parent_signals(filter);
-		if (filter->connected_scene_signals && filter->managed_source_names.num == 0) {
-			obs_data_t *s = obs_source_get_settings(filter->source);
-			move_source_switcher_update(filter, s);
-			obs_data_release(s);
-		}
 	}
 
-	if (!filter->transitioning || !filter->transition)
+	if (!filter->transitioning || !filter->move_transition)
 		return;
 
-	float t = obs_transition_get_time(filter->transition);
-	bool active = obs_transition_get_active(filter->transition);
+	float t = obs_transition_get_time(filter->move_transition);
+	bool active = obs_transition_get_active(filter->move_transition);
 	if (t >= 1.0f || !active) {
 		filter->transitioning = false;
-		filter->current_active_item = filter->incoming_item;
+		filter->current_active_item = filter->sceneitem_b;
 
-		obs_transition_clear(filter->transition);
+		obs_transition_clear(filter->move_transition);
 		clean_wrapper_scenes(filter);
 
+		/* Transition finished: turn off sceneitem_a's eye, keep sceneitem_b on */
 		filter->internal_visibility_change++;
-		if (filter->incoming_item)
-			obs_sceneitem_set_visible(filter->incoming_item, true);
-		if (filter->outgoing_item && filter->outgoing_item != filter->incoming_item)
-			obs_sceneitem_set_visible(filter->outgoing_item, false);
+		if (filter->sceneitem_a && filter->sceneitem_a != filter->sceneitem_b)
+			obs_sceneitem_set_visible(filter->sceneitem_a, false);
+		if (filter->sceneitem_b)
+			obs_sceneitem_set_visible(filter->sceneitem_b, true);
 		filter->internal_visibility_change--;
 
-		filter->outgoing_item = NULL;
-		filter->incoming_item = NULL;
+		filter->sceneitem_a = NULL;
+		filter->sceneitem_b = NULL;
 	}
 }
 
@@ -467,7 +506,6 @@ struct check_single_visibility_data {
 	bool found_active;
 };
 
-/* 3.4 Fix: non-destructive initial active item detection (no wiping visibility) */
 static bool init_active_item(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
 {
 	UNUSED_PARAMETER(scene);
@@ -502,9 +540,8 @@ static void move_source_switcher_update(void *data, obs_data_t *settings)
 
 	connect_parent_signals(filter);
 
-	/* 4.3 Fix: cache managed source names in memory */
 	free_managed_sources(filter);
-	obs_source_t *parent = obs_filter_get_parent(filter->source);
+	obs_source_t *parent = obs_filter_get_parent(filter->filter_source);
 	if (parent) {
 		obs_scene_t *scene = obs_scene_from_source(parent);
 		if (!scene)
@@ -539,7 +576,7 @@ static obs_properties_t *move_source_switcher_properties(void *data)
 	struct move_source_switcher_info *filter = data;
 	obs_properties_t *ppts = obs_properties_create();
 
-	obs_source_t *parent = obs_filter_get_parent(filter->source);
+	obs_source_t *parent = obs_filter_get_parent(filter->filter_source);
 	obs_scene_t *scene = obs_scene_from_source(parent);
 	if (!scene)
 		scene = obs_group_from_source(parent);

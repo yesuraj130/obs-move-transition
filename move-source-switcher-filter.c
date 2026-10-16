@@ -76,112 +76,59 @@ static bool is_item_managed(struct move_source_switcher_info *filter, obs_scenei
 	return false;
 }
 
-struct clone_scene_data {
-	obs_scene_t *target_scene;
+struct adjust_vis_data {
 	struct move_source_switcher_info *filter;
-	obs_sceneitem_t *active_switcher_item;
+	obs_source_t *active_source;
 };
 
-static void copy_sceneitem_properties(obs_sceneitem_t *dst, obs_sceneitem_t *src)
+static bool adjust_wrapper_item_vis(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
 {
-	struct vec2 pos, scale, bounds;
-	struct obs_sceneitem_crop crop;
-	obs_sceneitem_get_pos(src, &pos);
-	obs_sceneitem_get_scale(src, &scale);
-	obs_sceneitem_get_bounds(src, &bounds);
-	obs_sceneitem_get_crop(src, &crop);
-	float rot = obs_sceneitem_get_rot(src);
-	uint32_t align = obs_sceneitem_get_alignment(src);
-	enum obs_bounds_type bounds_type = obs_sceneitem_get_bounds_type(src);
-	uint32_t bounds_align = obs_sceneitem_get_bounds_alignment(src);
-	enum obs_blending_mode blend_mode = obs_sceneitem_get_blending_mode(src);
-	enum obs_blending_method blend_method = obs_sceneitem_get_blending_method(src);
-
-	obs_sceneitem_set_alignment(dst, align);
-	obs_sceneitem_set_bounds_type(dst, bounds_type);
-	obs_sceneitem_set_bounds_alignment(dst, bounds_align);
-	obs_sceneitem_set_bounds(dst, &bounds);
-	obs_sceneitem_set_pos(dst, &pos);
-	obs_sceneitem_set_scale(dst, &scale);
-	obs_sceneitem_set_rot(dst, rot);
-	obs_sceneitem_set_crop(dst, &crop);
-	obs_sceneitem_set_blending_mode(dst, blend_mode);
-	obs_sceneitem_set_blending_method(dst, blend_method);
-}
-
-static bool clone_item_to_wrapper(obs_scene_t *parent_scene, obs_sceneitem_t *item, void *param)
-{
-	UNUSED_PARAMETER(parent_scene);
-	struct clone_scene_data *data = param;
+	UNUSED_PARAMETER(scene);
+	struct adjust_vis_data *data = param;
 	obs_source_t *source = obs_sceneitem_get_source(item);
 	if (!source)
 		return true;
 
-	obs_sceneitem_t *new_item = obs_scene_add(data->target_scene, source);
-	if (!new_item)
+	const char *name = obs_source_get_name(source);
+	if (!name || !strlen(name))
 		return true;
 
-	copy_sceneitem_properties(new_item, item);
+	obs_data_t *settings = obs_source_get_settings(data->filter->filter_source);
+	bool checked = obs_data_get_bool(settings, name);
+	obs_data_release(settings);
 
-	if (is_item_managed(data->filter, item)) {
-		/* Switcher item: only visible if it matches the designated active item for this wrapper */
-		bool is_active = (item == data->active_switcher_item);
-		obs_sceneitem_set_visible(new_item, is_active);
-	} else {
-		/* Non-switcher item (background, chat, overlay): keep parent scene's visibility */
-		obs_sceneitem_set_visible(new_item, obs_sceneitem_visible(item));
+	bool managed = (data->filter->mode == FILTER_MODE_INCLUDE) ? checked : !checked;
+	if (managed) {
+		bool is_active = (data->active_source && source == data->active_source);
+		obs_sceneitem_set_visible(item, is_active);
 	}
 	return true;
 }
 
-static obs_source_t *create_wrapper_scene(obs_source_t *parent_scene, struct move_source_switcher_info *filter,
+static obs_source_t *create_wrapper_scene(obs_source_t *parent_source, struct move_source_switcher_info *filter,
 					  obs_sceneitem_t *active_item)
 {
+	if (!parent_source)
+		return NULL;
+
+	obs_scene_t *parent_scene = obs_scene_from_source(parent_source);
+	if (!parent_scene)
+		parent_scene = obs_group_from_source(parent_source);
 	if (!parent_scene)
 		return NULL;
 
-	uint32_t width = 0;
-	uint32_t height = 0;
-	struct obs_video_info ovi;
-	if (obs_get_video_info(&ovi)) {
-		width = ovi.base_width;
-		height = ovi.base_height;
-	}
-	if (!width || !height) {
-		width = obs_source_get_width(parent_scene);
-		height = obs_source_get_height(parent_scene);
-	}
-	if (!width)
-		width = 1920;
-	if (!height)
-		height = 1080;
-
-	obs_data_t *sd = obs_data_create();
-	obs_data_set_bool(sd, "custom_size", true);
-	obs_data_set_int(sd, "cx", width);
-	obs_data_set_int(sd, "cy", height);
-	obs_source_t *scene_source = obs_source_create_private("scene", "switcher_wrapper", sd);
-	obs_source_load(scene_source);
-	obs_data_release(sd);
-
-	if (!scene_source)
+	obs_scene_t *dup_scene = obs_scene_duplicate(parent_scene, "switcher_wrapper", OBS_SCENE_DUP_PRIVATE_REFS);
+	if (!dup_scene)
 		return NULL;
 
-	obs_scene_t *target_scene = obs_scene_from_source(scene_source);
-	obs_scene_t *parent_scene_obj = obs_scene_from_source(parent_scene);
-	if (!parent_scene_obj)
-		parent_scene_obj = obs_group_from_source(parent_scene);
+	obs_source_t *active_source = active_item ? obs_sceneitem_get_source(active_item) : NULL;
+	struct adjust_vis_data data = {
+		.filter = filter,
+		.active_source = active_source,
+	};
+	obs_scene_enum_items(dup_scene, adjust_wrapper_item_vis, &data);
 
-	if (target_scene && parent_scene_obj) {
-		struct clone_scene_data csd = {
-			.target_scene = target_scene,
-			.filter = filter,
-			.active_switcher_item = active_item,
-		};
-		obs_scene_enum_items(parent_scene_obj, clone_item_to_wrapper, &csd);
-	}
-
-	return scene_source;
+	return obs_scene_get_source(dup_scene);
 }
 
 static void start_switcher_transition(struct move_source_switcher_info *filter, obs_sceneitem_t *from_item,

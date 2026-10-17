@@ -183,6 +183,12 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 		obs_transition_force_stop(filter->move_transition);
 		obs_transition_clear(filter->move_transition);
 		clean_wrapper_scenes(filter);
+
+		/* Immediately turn off the superseded outgoing source so it doesn't linger */
+		if (filter->sceneitem_a && filter->sceneitem_a != to_item && filter->sceneitem_a != from_item) {
+			obs_sceneitem_set_visible(filter->sceneitem_a, false);
+		}
+
 		filter->transitioning = false;
 	}
 

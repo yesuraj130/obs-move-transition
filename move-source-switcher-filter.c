@@ -21,7 +21,6 @@ struct move_source_switcher_info {
 	obs_sceneitem_t *sceneitem_b;
 
 	bool transitioning;
-	int internal_visibility_change;
 
 	enum filter_mode mode;
 	uint32_t duration;
@@ -224,9 +223,6 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 static void on_item_visible(void *data, calldata_t *calldata)
 {
 	struct move_source_switcher_info *filter = data;
-	if (filter->internal_visibility_change > 0)
-		return;
-
 	obs_sceneitem_t *item = (obs_sceneitem_t *)calldata_ptr(calldata, "item");
 	bool visible = calldata_bool(calldata, "visible");
 	if (!item)
@@ -247,6 +243,9 @@ static void on_item_visible(void *data, calldata_t *calldata)
 
 		start_switcher_transition(filter, from_item, item);
 	} else {
+		if (item == filter->sceneitem_a)
+			return;
+
 		if (item == filter->current_active_item && !filter->transitioning) {
 			filter->current_active_item = NULL;
 		}
@@ -485,10 +484,8 @@ static void move_source_switcher_tick(void *data, float seconds)
 		clean_wrapper_scenes(filter);
 
 		/* Transition finished: turn off sceneitem_a's eye, keep sceneitem_b on */
-		filter->internal_visibility_change++;
 		if (filter->sceneitem_a && filter->sceneitem_a != filter->sceneitem_b)
 			obs_sceneitem_set_visible(filter->sceneitem_a, false);
-		filter->internal_visibility_change--;
 
 		filter->sceneitem_a = NULL;
 		filter->sceneitem_b = NULL;

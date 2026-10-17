@@ -1,0 +1,11 @@
+{
+  "name": "obs-move-source-switcher",
+  "version": "1.0.0",
+  "description": "OBS Move Source Switcher Filter - Code & Interactive Simulator",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  }
+}

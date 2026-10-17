@@ -63,12 +63,8 @@ static void free_managed_sources(struct move_source_switcher_info *filter)
 	da_init(filter->managed_item_ids);
 }
 
-static bool is_item_managed(struct move_source_switcher_info *filter, obs_sceneitem_t *item)
+static bool is_id_managed(struct move_source_switcher_info *filter, int64_t id)
 {
-	if (!item)
-		return false;
-
-	int64_t id = obs_sceneitem_get_id(item);
 	for (size_t i = 0; i < filter->managed_item_ids.num; i++) {
 		if (filter->managed_item_ids.array[i] == id)
 			return true;
@@ -76,30 +72,42 @@ static bool is_item_managed(struct move_source_switcher_info *filter, obs_scenei
 	return false;
 }
 
+static bool is_item_managed(struct move_source_switcher_info *filter, obs_sceneitem_t *item)
+{
+	if (!item)
+		return false;
+
+	return is_id_managed(filter, obs_sceneitem_get_id(item));
+}
+
 struct adjust_vis_data {
 	struct move_source_switcher_info *filter;
-	obs_source_t *active_source;
-	obs_data_t *settings;
+	int64_t active_item_id;
+	DARRAY(int64_t) parent_ids;
+	size_t current_index;
 };
 
 static bool adjust_wrapper_item_vis(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
 {
 	UNUSED_PARAMETER(scene);
 	struct adjust_vis_data *data = param;
-	obs_source_t *source = obs_sceneitem_get_source(item);
-	if (!source)
+	if (data->current_index >= data->parent_ids.num)
 		return true;
 
-	const char *name = obs_source_get_name(source);
-	if (!name || !strlen(name))
-		return true;
-
-	bool checked = obs_data_get_bool(data->settings, name);
-	bool managed = (data->filter->mode == FILTER_MODE_INCLUDE) ? checked : !checked;
-	if (managed) {
-		bool is_active = (data->active_source && source == data->active_source);
+	int64_t parent_item_id = data->parent_ids.array[data->current_index++];
+	if (is_id_managed(data->filter, parent_item_id)) {
+		bool is_active = (data->active_item_id != 0 && parent_item_id == data->active_item_id);
 		obs_sceneitem_set_visible(item, is_active);
 	}
+	return true;
+}
+
+static bool collect_parent_item_ids(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
+{
+	UNUSED_PARAMETER(scene);
+	DARRAY(int64_t) *array = param;
+	int64_t id = obs_sceneitem_get_id(item);
+	da_push_back(*array, &id);
 	return true;
 }
 
@@ -119,15 +127,18 @@ static obs_source_t *create_wrapper_scene(obs_source_t *parent_source, struct mo
 	if (!dup_scene)
 		return NULL;
 
-	obs_source_t *active_source = active_item ? obs_sceneitem_get_source(active_item) : NULL;
-	obs_data_t *settings = obs_source_get_settings(filter->filter_source);
+	int64_t active_id = active_item ? obs_sceneitem_get_id(active_item) : 0;
 	struct adjust_vis_data data = {
 		.filter = filter,
-		.active_source = active_source,
-		.settings = settings,
+		.active_item_id = active_id,
+		.current_index = 0,
 	};
+	da_init(data.parent_ids);
+	obs_scene_enum_items(parent_scene, collect_parent_item_ids, &data.parent_ids);
+
 	obs_scene_enum_items(dup_scene, adjust_wrapper_item_vis, &data);
-	obs_data_release(settings);
+
+	da_free(data.parent_ids);
 
 	return obs_scene_get_source(dup_scene);
 }
@@ -143,9 +154,8 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 	if (!source_b)
 		return;
 
-	/* Identical source collision */
-	if (source_a && source_a == source_b) {
-		filter->current_active_item = to_item;
+	/* Ignore if switching to the exact same item already active */
+	if (from_item && from_item == to_item) {
 		return;
 	}
 

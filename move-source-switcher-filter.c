@@ -194,9 +194,6 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 	/* First Show handling: if from_item is NULL and duration is 0, hard cut */
 	if (!from_item && filter->duration == 0) {
 		filter->current_active_item = to_item;
-		filter->internal_visibility_change++;
-		obs_sceneitem_set_visible(to_item, true);
-		filter->internal_visibility_change--;
 		return;
 	}
 
@@ -491,8 +488,6 @@ static void move_source_switcher_tick(void *data, float seconds)
 		filter->internal_visibility_change++;
 		if (filter->sceneitem_a && filter->sceneitem_a != filter->sceneitem_b)
 			obs_sceneitem_set_visible(filter->sceneitem_a, false);
-		if (filter->sceneitem_b)
-			obs_sceneitem_set_visible(filter->sceneitem_b, true);
 		filter->internal_visibility_change--;
 
 		filter->sceneitem_a = NULL;

@@ -14,3 +14,12 @@
 
 # AI Studio
 .aistudio/
+metadata.json
+
+# Node / web artifacts
+package.json
+package-lock.json
+node_modules/
+server.js
+server.ts
+dist/

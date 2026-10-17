@@ -290,6 +290,10 @@ void move_filter_deactivate(void *data);
 void move_filter_show(void *data);
 void move_filter_hide(void *data);
 
+void prop_list_add_positions(obs_property_t *p);
 void prop_list_add_easings(obs_property_t *p);
 void prop_list_add_easing_functions(obs_property_t *p);
+void prop_list_add_transitions(obs_property_t *p);
+void prop_list_add_scales(obs_property_t *p);
+void move_defaults(obs_data_t *settings);
 void prop_list_add_move_source_filter(obs_source_t *parent, obs_source_t *child, void *data);

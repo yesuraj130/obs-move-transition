@@ -24,14 +24,6 @@ struct move_source_switcher_info {
 
 	enum filter_mode mode;
 	uint32_t duration;
-	long long easing;
-	long long easing_function;
-	double curve;
-	bool nested_scenes;
-	bool name_part_match;
-	bool name_number_match;
-	bool name_last_word_match;
-	uint32_t switch_percentage;
 
 	signal_handler_t *connected_scene_signals;
 
@@ -158,24 +150,12 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 	}
 
 	if (!filter->move_transition) {
-		obs_data_t *settings = obs_data_create();
+		obs_data_t *settings = obs_source_get_settings(filter->filter_source);
 		filter->move_transition = obs_source_create_private("move_transition", "internal_move_switcher", settings);
 		obs_data_release(settings);
 	}
 	if (!filter->move_transition)
 		return;
-
-	obs_data_t *s = obs_source_get_settings(filter->move_transition);
-	obs_data_set_int(s, S_EASING_MATCH, filter->easing);
-	obs_data_set_int(s, S_EASING_FUNCTION_MATCH, filter->easing_function);
-	obs_data_set_double(s, S_CURVE_MATCH, filter->curve);
-	obs_data_set_bool(s, S_NESTED_SCENES, filter->nested_scenes);
-	obs_data_set_bool(s, S_NAME_PART_MATCH, filter->name_part_match);
-	obs_data_set_bool(s, S_NAME_NUMBER_MATCH, filter->name_number_match);
-	obs_data_set_bool(s, S_NAME_LAST_WORD_MATCH, filter->name_last_word_match);
-	obs_data_set_int(s, S_SWITCH_PERCENTAGE, (long long)filter->switch_percentage);
-	obs_source_update(filter->move_transition, s);
-	obs_data_release(s);
 
 	/* Rapid switching: stop previous transition cleanly */
 	if (filter->transitioning) {
@@ -420,9 +400,7 @@ static void *move_source_switcher_create(obs_data_t *settings, obs_source_t *sou
 	filter->filter_source = source;
 	da_init(filter->managed_item_ids);
 
-	obs_data_t *trans_settings = obs_data_create();
-	filter->move_transition = obs_source_create_private("move_transition", "internal_move_switcher", trans_settings);
-	obs_data_release(trans_settings);
+	filter->move_transition = obs_source_create_private("move_transition", "internal_move_switcher", settings);
 
 	signal_handler_connect(obs_get_signal_handler(), "source_rename", on_source_rename, filter);
 	connect_parent_signals(filter);
@@ -524,14 +502,12 @@ static void move_source_switcher_update(void *data, obs_data_t *settings)
 	struct move_source_switcher_info *filter = data;
 	filter->mode = (enum filter_mode)obs_data_get_int(settings, "filter_mode");
 	filter->duration = (uint32_t)obs_data_get_int(settings, S_DURATION);
-	filter->easing = obs_data_get_int(settings, S_EASING_MATCH);
-	filter->easing_function = obs_data_get_int(settings, S_EASING_FUNCTION_MATCH);
-	filter->curve = obs_data_get_double(settings, S_CURVE_MATCH);
-	filter->nested_scenes = obs_data_get_bool(settings, S_NESTED_SCENES);
-	filter->name_part_match = obs_data_get_bool(settings, S_NAME_PART_MATCH);
-	filter->name_number_match = obs_data_get_bool(settings, S_NAME_NUMBER_MATCH);
-	filter->name_last_word_match = obs_data_get_bool(settings, S_NAME_LAST_WORD_MATCH);
-	filter->switch_percentage = (uint32_t)obs_data_get_int(settings, S_SWITCH_PERCENTAGE);
+
+	if (filter->move_transition) {
+		obs_source_update(filter->move_transition, settings);
+	} else {
+		filter->move_transition = obs_source_create_private("move_transition", "internal_move_switcher", settings);
+	}
 
 	connect_parent_signals(filter);
 
@@ -551,18 +527,15 @@ static void move_source_switcher_update(void *data, obs_data_t *settings)
 	}
 }
 
-static bool add_item_checkbox(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
+struct item_list {
+	DARRAY(obs_sceneitem_t *) items;
+};
+
+static bool collect_scene_items(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
 {
 	UNUSED_PARAMETER(scene);
-	obs_properties_t *props = param;
-	obs_source_t *source = obs_sceneitem_get_source(item);
-	if (!source)
-		return true;
-	const char *name = obs_source_get_name(source);
-	if (!name || !strlen(name))
-		return true;
-
-	obs_properties_add_bool(props, name, name);
+	struct item_list *list = param;
+	da_push_back(list->items, &item);
 	return true;
 }
 
@@ -588,32 +561,89 @@ static obs_properties_t *move_source_switcher_properties(void *data)
 	obs_property_list_add_int(mode_list, obs_module_text("FilterMode.Exclude"), FILTER_MODE_EXCLUDE);
 
 	obs_properties_t *sources_group = obs_properties_create();
-	obs_scene_enum_items(scene, add_item_checkbox, sources_group);
+	struct item_list list;
+	da_init(list.items);
+	obs_scene_enum_items(scene, collect_scene_items, &list);
+	for (size_t i = list.items.num; i > 0; i--) {
+		obs_sceneitem_t *item = list.items.array[i - 1];
+		obs_source_t *source = obs_sceneitem_get_source(item);
+		if (!source)
+			continue;
+		const char *name = obs_source_get_name(source);
+		if (!name || !strlen(name))
+			continue;
+		obs_properties_add_bool(sources_group, name, name);
+	}
+	da_free(list.items);
 	obs_properties_add_group(ppts, "managed_sources", obs_module_text("ManagedSources"), OBS_GROUP_NORMAL, sources_group);
 
-	obs_properties_t *trans_group = obs_properties_create();
-	obs_property_t *p = obs_properties_add_int(trans_group, S_DURATION, obs_module_text("Duration"), 0, 10000, 50);
+	obs_property_t *p = obs_properties_add_int(ppts, S_DURATION, obs_module_text("Duration"), 0, 10000, 50);
 	obs_property_int_set_suffix(p, "ms");
 
-	p = obs_properties_add_list(trans_group, S_EASING_MATCH, obs_module_text("Easing"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	prop_list_add_easings(p);
+	// General
+	obs_properties_t *group = obs_properties_create();
+	obs_properties_add_bool(group, S_NESTED_SCENES, obs_module_text("NestedScenes"));
+	obs_properties_add_bool(group, S_CACHE_TRANSITIONS, obs_module_text("CacheTransitions"));
+	p = obs_properties_add_int_slider(group, S_SWITCH_PERCENTAGE, obs_module_text("SwitchPoint"), 0, 100, 1);
+	obs_property_int_set_suffix(p, "%");
+	obs_properties_add_group(ppts, S_MOVE_ALL, obs_module_text("MoveAll"), OBS_GROUP_NORMAL, group);
 
-	p = obs_properties_add_list(trans_group, S_EASING_FUNCTION_MATCH, obs_module_text("EasingFunction"), OBS_COMBO_TYPE_LIST,
+	// Match if the source name...
+	group = obs_properties_create();
+	obs_properties_add_bool(group, S_NAME_PART_MATCH, obs_module_text("NamePartMatch"));
+	obs_properties_add_bool(group, S_NAME_NUMBER_MATCH, obs_module_text("NameNumberMatch"));
+	obs_properties_add_bool(group, S_NAME_LAST_WORD_MATCH, obs_module_text("NameLastWordMatch"));
+	obs_properties_add_group(ppts, S_MATCH, obs_module_text("MatchName"), OBS_GROUP_NORMAL, group);
+
+	// Matched items
+	group = obs_properties_create();
+	p = obs_properties_add_list(group, S_EASING_MATCH, obs_module_text("Easing"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	prop_list_add_easings(p);
+	p = obs_properties_add_list(group, S_EASING_FUNCTION_MATCH, obs_module_text("EasingFunction"), OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_INT);
 	prop_list_add_easing_functions(p);
+	p = obs_properties_add_list(group, S_TRANSITION_MATCH, obs_module_text("Transition"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	prop_list_add_transitions(p);
+	p = obs_properties_add_list(group, S_TRANSITION_SCALE, obs_module_text("TransitionScaleType"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	prop_list_add_scales(p);
+	obs_properties_add_float_slider(group, S_CURVE_MATCH, obs_module_text("Curve"), -2.0, 2.0, 0.01);
+	obs_properties_add_group(ppts, S_MOVE_MATCH, obs_module_text("MoveMatch"), OBS_GROUP_NORMAL, group);
 
-	obs_properties_add_float_slider(trans_group, S_CURVE_MATCH, obs_module_text("Curve"), -2.0, 2.0, 0.01);
+	// Appearing items
+	group = obs_properties_create();
+	p = obs_properties_add_list(group, S_EASING_IN, obs_module_text("Easing"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	prop_list_add_easings(p);
+	p = obs_properties_add_list(group, S_EASING_FUNCTION_IN, obs_module_text("EasingFunction"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	prop_list_add_easing_functions(p);
+	p = obs_properties_add_float_slider(group, S_ZOOM_IN, obs_module_text("Zoom"), 0.0, 200.0, 1.0);
+	obs_property_float_set_suffix(p, "%");
+	p = obs_properties_add_list(group, S_POSITION_IN, obs_module_text("Position"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	prop_list_add_positions(p);
+	p = obs_properties_add_list(group, S_TRANSITION_IN, obs_module_text("Transition"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	prop_list_add_transitions(p);
+	obs_properties_add_float_slider(group, S_CURVE_IN, obs_module_text("Curve"), -2.0, 2.0, 0.01);
+	obs_properties_add_group(ppts, S_MOVE_IN, obs_module_text("MoveIn"), OBS_GROUP_NORMAL, group);
 
-	obs_properties_add_bool(trans_group, S_NESTED_SCENES, obs_module_text("NestedScenes"));
-
-	obs_properties_add_bool(trans_group, S_NAME_PART_MATCH, obs_module_text("NamePartMatch"));
-	obs_properties_add_bool(trans_group, S_NAME_NUMBER_MATCH, obs_module_text("NameNumberMatch"));
-	obs_properties_add_bool(trans_group, S_NAME_LAST_WORD_MATCH, obs_module_text("NameLastWordMatch"));
-
-	p = obs_properties_add_int_slider(trans_group, S_SWITCH_PERCENTAGE, obs_module_text("SwitchPoint"), 0, 100, 1);
-	obs_property_int_set_suffix(p, "%");
-
-	obs_properties_add_group(ppts, "transition_settings", obs_module_text("Transition"), OBS_GROUP_NORMAL, trans_group);
+	// Disappearing items
+	group = obs_properties_create();
+	p = obs_properties_add_list(group, S_EASING_OUT, obs_module_text("Easing"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	prop_list_add_easings(p);
+	p = obs_properties_add_list(group, S_EASING_FUNCTION_OUT, obs_module_text("EasingFunction"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	prop_list_add_easing_functions(p);
+	p = obs_properties_add_float_slider(group, S_ZOOM_OUT, obs_module_text("Zoom"), 0.0, 200.0, 1.0);
+	obs_property_float_set_suffix(p, "%");
+	p = obs_properties_add_list(group, S_POSITION_OUT, obs_module_text("Position"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	prop_list_add_positions(p);
+	p = obs_properties_add_list(group, S_TRANSITION_OUT, obs_module_text("Transition"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
+	prop_list_add_transitions(p);
+	obs_properties_add_float_slider(group, S_CURVE_OUT, obs_module_text("Curve"), -2.0, 2.0, 0.01);
+	obs_properties_add_group(ppts, S_MOVE_OUT, obs_module_text("MoveOut"), OBS_GROUP_NORMAL, group);
 
 	return ppts;
 }
@@ -622,14 +652,11 @@ static void move_source_switcher_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "filter_mode", FILTER_MODE_INCLUDE);
 	obs_data_set_default_int(settings, S_DURATION, 500);
-	obs_data_set_default_int(settings, S_EASING_MATCH, EASE_IN_OUT);
-	obs_data_set_default_int(settings, S_EASING_FUNCTION_MATCH, EASING_CUBIC);
-	obs_data_set_default_double(settings, S_CURVE_MATCH, 0.0);
-	obs_data_set_default_bool(settings, S_NESTED_SCENES, true);
+	move_defaults(settings);
 	obs_data_set_default_bool(settings, S_NAME_PART_MATCH, true);
 	obs_data_set_default_bool(settings, S_NAME_NUMBER_MATCH, true);
 	obs_data_set_default_bool(settings, S_NAME_LAST_WORD_MATCH, true);
-	obs_data_set_default_int(settings, S_SWITCH_PERCENTAGE, 50);
+	obs_data_set_default_bool(settings, S_CACHE_TRANSITIONS, false);
 }
 
 struct obs_source_info move_source_switcher_filter = {

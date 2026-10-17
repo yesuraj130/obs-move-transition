@@ -27,33 +27,75 @@ jobs:
 
   create-release:
     name: Create Release 🛫
-    if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     needs: build-project
     defaults:
       run:
         shell: bash
     steps:
-      - name: Check Release Tag ☑️
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check or Auto-Generate Release Tag ☑️
         id: check
         run: |
-          : Check Release Tag ☑️
+          : Check or Auto-Generate Release Tag ☑️
           if [[ "${RUNNER_DEBUG}" ]]; then set -x; fi
           shopt -s extglob
 
-          case "${GITHUB_REF_NAME}" in
-            +([0-9]).+([0-9]).+([0-9]) )
-              echo 'validTag=true' >> $GITHUB_OUTPUT
-              echo 'prerelease=false' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-              ;;
-            +([0-9]).+([0-9]).+([0-9])-@(beta|rc)*([0-9]) )
-              echo 'validTag=true' >> $GITHUB_OUTPUT
-              echo 'prerelease=true' >> $GITHUB_OUTPUT
-              echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
-              ;;
-            *) echo 'validTag=false' >> $GITHUB_OUTPUT ;;
-          esac
+          git fetch --tags --force 2>/dev/null || true
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            case "${GITHUB_REF_NAME}" in
+              +([0-9]).+([0-9]).+([0-9]) )
+                echo 'validTag=true' >> $GITHUB_OUTPUT
+                echo 'prerelease=false' >> $GITHUB_OUTPUT
+                echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+                ;;
+              +([0-9]).+([0-9]).+([0-9])-@(beta|rc)*([0-9]) )
+                echo 'validTag=true' >> $GITHUB_OUTPUT
+                echo 'prerelease=true' >> $GITHUB_OUTPUT
+                echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+                ;;
+              *) echo 'validTag=false' >> $GITHUB_OUTPUT ;;
+            esac
+          else
+            # Pushed to a branch: auto-determine next tag version
+            buildspec_version="$(sed -n -E 's/^[[:space:]]*"version":[[:space:]]*"([^"]+)".*/\1/p' buildspec.json | tail -n 1)"
+            if [[ -z "${buildspec_version}" ]]; then
+              buildspec_version="1.0.0"
+            fi
+
+            IFS='.' read -r major minor patch <<< "${buildspec_version}"
+            major="${major:-1}"
+            minor="${minor:-0}"
+            patch="${patch:-0}"
+
+            highest_patch=-1
+            existing_tags="$(git tag -l "*${major}.${minor}.*")"
+
+            for tag in ${existing_tags}; do
+              if [[ "${tag}" =~ ^v?${major}\.${minor}\.([0-9]+)$ ]]; then
+                p="${BASH_REMATCH[1]}"
+                if (( p > highest_patch )); then
+                  highest_patch=$p
+                fi
+              fi
+            done
+
+            if (( highest_patch >= patch )); then
+              new_patch=$((highest_patch + 1))
+            else
+              new_patch=$patch
+            fi
+
+            target_version="${major}.${minor}.${new_patch}"
+
+            echo 'validTag=true' >> $GITHUB_OUTPUT
+            echo 'prerelease=false' >> $GITHUB_OUTPUT
+            echo "version=${target_version}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Download Build Artifacts 📥
         uses: actions/download-artifact@v4
@@ -105,9 +147,10 @@ jobs:
         id: create_release
         uses: softprops/action-gh-release@9d7c94cfd0a1f3ed45544c887983e9fa900f0564
         with:
-          draft: true
+          draft: false
           prerelease: ${{ fromJSON(steps.check.outputs.prerelease) }}
           tag_name: ${{ steps.check.outputs.version }}
+          target_commitish: ${{ github.sha }}
           name: ${{ needs.build-project.outputs.pluginName }} ${{ steps.check.outputs.version }}
           body_path: ${{ github.workspace }}/CHECKSUMS.txt
           files: |

@@ -43,6 +43,7 @@ runs:
 
         if [[ '${{ inputs.codesign }}' == 'true' ]] build_args+=(--codesign)
 
+        chmod +x .github/scripts/build-macos
         git fetch origin --no-tags --no-recurse-submodules -q
         .github/scripts/build-macos ${build_args}
 
@@ -75,6 +76,8 @@ runs:
         CCACHE_DIR: ${{ inputs.workingDirectory }}/.ccache
       run: |
         : Run Ubuntu Build
+
+        chmod +x .github/scripts/build-ubuntu
 
         local -a build_args=(
           --target ubuntu-${{ inputs.target }}

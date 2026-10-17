@@ -67,6 +67,7 @@ runs:
         if [[ '${{ inputs.notarize }}' == 'true' ]] package_args+=(--notarize)
         if [[ '${{ inputs.package }}' == 'true' ]] package_args+=(--package)
 
+        chmod +x .github/scripts/package-macos
         .github/scripts/package-macos ${package_args}
 
     - name: Install Dependencies 🛍️
@@ -86,6 +87,7 @@ runs:
       working-directory: ${{ inputs.workingDirectory }}
       run: |
         : Run Ubuntu Packaging
+        chmod +x .github/scripts/package-ubuntu
         package_args=(
           --target ubuntu-${{ inputs.target }}
           --config ${{ inputs.config }}

@@ -148,7 +148,6 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 	if (!to_item)
 		return;
 
-	obs_source_t *source_a = from_item ? obs_sceneitem_get_source(from_item) : NULL;
 	obs_source_t *source_b = obs_sceneitem_get_source(to_item);
 	if (!source_b)
 		return;

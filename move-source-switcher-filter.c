@@ -481,7 +481,7 @@ static void move_source_switcher_tick(void *data, float seconds)
 		return;
 
 	float t = obs_transition_get_time(filter->move_transition);
-	bool active = obs_transition_get_active(filter->move_transition);
+	bool active = obs_transition_is_active(filter->move_transition);
 	if (t >= 1.0f || !active) {
 		filter->transitioning = false;
 		filter->current_active_item = filter->sceneitem_b;

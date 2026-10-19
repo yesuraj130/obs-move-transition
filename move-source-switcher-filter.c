@@ -57,22 +57,47 @@ static inline bool is_source_excluded(struct move_source_switcher_info *filter, 
 	return false;
 }
 
-struct wrapper_filter_and_obs_source
+struct find_sceneitem_index_data
+{
+	obs_sceneitem_t *target_item;
+	int target_index;  //sceneitem index result
+	int current_index;  //used for temporary storage while iterating
+};
+
+static bool find_sceneitem_index(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
+{
+	UNUSED_PARAMETER(scene);
+	struct find_sceneitem_index_data *data = param;
+	if (item == data->target_item)
+	{
+		data->target_index = data->current_index;
+		return false;
+	}
+	data->current_index++;
+	return true;
+}
+
+struct adjust_sceneitem_visibility_data
 {
 	struct move_source_switcher_info *filter;
-	obs_source_t *target_source;
+	int target_index;  //sceneitem index result
+	int current_index;  //used for temporary storage while iterating
 };
+#define adjust_sceneitem_visivility_data adjust_sceneitem_visibility_data
 
 static bool adjust_wrapper_scene_item_visibility(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
 {
 	UNUSED_PARAMETER(scene);
-	struct wrapper_filter_and_obs_source *data = param;
+	struct adjust_sceneitem_visibility_data *data = param;
 	obs_source_t *source = obs_sceneitem_get_source(item);
+
+	int idx = data->current_index++;
 
 	if (is_source_excluded(data->filter, source)) return true;
 
-  //only target_source is visible in wrapper scene, others are made hidden
-	obs_sceneitem_set_visible(item, data->target_source != NULL && source == data->target_source);
+	// Only target_item (by 1:1 index alignment) is visible in wrapper scene; other non-excluded items are hidden.
+	// This uniquely isolates duplicate references with different transforms or filters.
+	obs_sceneitem_set_visible(item, data->target_index >= 0 && idx == data->target_index);
 	return true;
 }
 
@@ -87,10 +112,22 @@ static obs_source_t *create_wrapper_scene(obs_source_t *parent_source, struct mo
 	obs_scene_t *dup_scene = obs_scene_duplicate(parent_scene, "switcher_wrapper", OBS_SCENE_DUP_PRIVATE_REFS);
 	if (!dup_scene) return NULL;
 
-	struct wrapper_filter_and_obs_source data = 
+	struct find_sceneitem_index_data find_data =
+	{
+		.target_item = active_item,
+		.target_index = -1,
+		.current_index = 0,
+	};
+	if (active_item)
+	{
+		obs_scene_enum_items(parent_scene, find_sceneitem_index, &find_data);
+	}
+
+	struct adjust_sceneitem_visibility_data data =
 	{
 		.filter = filter,
-		.target_source = active_item ? obs_sceneitem_get_source(active_item) : NULL,
+		.target_index = find_data.target_index,
+		.current_index = 0,
 	};
 	obs_scene_enum_items(dup_scene, adjust_wrapper_scene_item_visibility, &data);
 
@@ -350,7 +387,7 @@ static void move_source_switcher_destroy(void *data)
 
 	clean_wrapper_scenes(filter);
 
-	dstr_free_tokens(filter->excluded_sources);
+	strlist_free(filter->excluded_sources);
 	filter->excluded_sources = NULL;
 
 	bfree(filter);
@@ -410,11 +447,12 @@ static void move_source_switcher_tick(void *data, float seconds)
 		obs_transition_clear(filter->move_transition);
 		clean_wrapper_scenes(filter);
 		filter->transitioning = false;
-		filter->sceneitem_a = NULL;
-		filter->sceneitem_b = NULL;
 
 		//Transition finished: turn off sceneitem_a's eye, keep sceneitem_b on
 		if (filter->sceneitem_a && filter->sceneitem_a != filter->sceneitem_b && obs_sceneitem_visible(filter->sceneitem_a)) obs_sceneitem_set_visible(filter->sceneitem_a, false);
+
+		filter->sceneitem_a = NULL;
+		filter->sceneitem_b = NULL;
 	}
 }
 
@@ -423,7 +461,7 @@ static void move_source_switcher_update(void *data, obs_data_t *settings)
 	struct move_source_switcher_info *filter = data;
 	filter->duration = (uint32_t)obs_data_get_int(settings, S_DURATION);
 
-	dstr_free_tokens(filter->excluded_sources);
+	strlist_free(filter->excluded_sources);
 	filter->excluded_sources = NULL;
 
 	const char *excluded_str = obs_data_get_string(settings, "excluded_sources");
@@ -434,7 +472,7 @@ static void move_source_switcher_update(void *data, obs_data_t *settings)
 		{
 			if (*c == '\n' || *c == '\r') *c = ',';
 		}
-		filter->excluded_sources = dstr_split(copy, ',', false);
+		filter->excluded_sources = strlist_split(copy, ',', false);
 		bfree(copy);
 
 		for (char **p = filter->excluded_sources; p && *p; p++)

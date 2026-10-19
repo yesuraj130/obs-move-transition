@@ -2,13 +2,7 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/dstr.h>
-#include <util/darray.h>
 #include <util/threading.h>
-
-enum filter_mode {
-	FILTER_MODE_INCLUDE = 0,
-	FILTER_MODE_EXCLUDE = 1,
-};
 
 struct move_source_switcher_info {
 	obs_source_t *filter_source; //pointer to move source switcher filter itself
@@ -22,12 +16,11 @@ struct move_source_switcher_info {
 
 	bool transitioning; //flag to mark currently transition happening
 
-	enum filter_mode mode; //current filter mode applied in the filter properties
 	uint32_t duration; //current transition duration applied in the filter properties
 
-	signal_handler_t *connected_scene_signals; //required to detect source added/deleted
+	signal_handler_t *connected_scene_signals; //required to detect visibility changes and scene destruction
 
-	DARRAY(int64_t) managed_item_ids; //array if source item unique ids that are checked in filter properties
+	char **excluded_sources; //NULL-terminated array of excluded source name strings
 };
 
 static const char *move_source_switcher_get_name(void *type_data)
@@ -50,62 +43,42 @@ static void clean_wrapper_scenes(struct move_source_switcher_info *filter)
 	}
 }
 
-static void free_managed_sources(struct move_source_switcher_info *filter)
+static inline bool is_source_excluded(struct move_source_switcher_info *filter, obs_source_t *source)
 {
-	da_free(filter->managed_item_ids);
-	da_init(filter->managed_item_ids);
-}
+	if (!filter->excluded_sources || !source) return false;
 
-static bool is_id_managed(struct move_source_switcher_info *filter, int64_t id)
-{
-	for (size_t i = 0; i < filter->managed_item_ids.num; i++)
+	const char *name = obs_source_get_name(source);
+	if (!name || !*name) return false;
+
+	for (char **p = filter->excluded_sources; *p; p++)
 	{
-		if (filter->managed_item_ids.array[i] == id) return true;
+		if (astrcmpi(*p, name) == 0) return true;
 	}
 	return false;
 }
 
-static bool is_item_managed(struct move_source_switcher_info *filter, obs_sceneitem_t *item)
-{
-	if (!item) return false;
-	return is_id_managed(filter, obs_sceneitem_get_id(item));
-}
-
-struct adjust_vis_data
+struct wrapper_filter_and_obs_source
 {
 	struct move_source_switcher_info *filter;
-	int64_t active_item_id;
-	DARRAY(int64_t) parent_ids;
-	size_t current_index;
+	obs_source_t *target_source;
 };
 
-static bool adjust_wrapper_item_vis(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
+static bool adjust_wrapper_scene_item_visibility(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
 {
 	UNUSED_PARAMETER(scene);
-	struct adjust_vis_data *data = param;
-	if (data->current_index >= data->parent_ids.num) return true;
+	struct wrapper_filter_and_obs_source *data = param;
+	obs_source_t *source = obs_sceneitem_get_source(item);
 
-	int64_t parent_item_id = data->parent_ids.array[data->current_index++];
-	if (is_id_managed(data->filter, parent_item_id))
-	{
-		bool is_active = (data->active_item_id != 0 && parent_item_id == data->active_item_id);
-		obs_sceneitem_set_visible(item, is_active);
-	}
-	return true;
-}
+	if (is_source_excluded(data->filter, source)) return true;
 
-static bool collect_parent_item_ids(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
-{
-	UNUSED_PARAMETER(scene);
-	DARRAY(int64_t) *array = param;
-	int64_t id = obs_sceneitem_get_id(item);
-	da_push_back(*array, &id);
+  //only target_source is visible in wrapper scene, others are made hidden
+	obs_sceneitem_set_visible(item, data->target_source != NULL && source == data->target_source);
 	return true;
 }
 
 static obs_source_t *create_wrapper_scene(obs_source_t *parent_source, struct move_source_switcher_info *filter, obs_sceneitem_t *active_item)
 {
-	if (!parent_source)	return NULL;
+	if (!parent_source) return NULL;
 
 	obs_scene_t *parent_scene = obs_scene_from_source(parent_source);
 	if (!parent_scene) parent_scene = obs_group_from_source(parent_source);
@@ -114,19 +87,12 @@ static obs_source_t *create_wrapper_scene(obs_source_t *parent_source, struct mo
 	obs_scene_t *dup_scene = obs_scene_duplicate(parent_scene, "switcher_wrapper", OBS_SCENE_DUP_PRIVATE_REFS);
 	if (!dup_scene) return NULL;
 
-	int64_t active_id = active_item ? obs_sceneitem_get_id(active_item) : 0;
-	struct adjust_vis_data data =
+	struct wrapper_filter_and_obs_source data = 
 	{
 		.filter = filter,
-		.active_item_id = active_id,
-		.current_index = 0,
+		.target_source = active_item ? obs_sceneitem_get_source(active_item) : NULL,
 	};
-	da_init(data.parent_ids);
-	obs_scene_enum_items(parent_scene, collect_parent_item_ids, &data.parent_ids);
-
-	obs_scene_enum_items(dup_scene, adjust_wrapper_item_vis, &data);
-
-	da_free(data.parent_ids);
+	obs_scene_enum_items(dup_scene, adjust_wrapper_scene_item_visibility, &data);
 
 	return obs_scene_get_source(dup_scene);
 }
@@ -149,7 +115,7 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 	}
 	if (!filter->move_transition) return;
 
-	//if transition alread happening, stop previous transition cleanly 
+	//if transition already happening, stop previous transition cleanly 
 	if (filter->transitioning)
 	{
 		obs_transition_force_stop(filter->move_transition);
@@ -175,7 +141,7 @@ static void start_switcher_transition(struct move_source_switcher_info *filter, 
 	filter->sceneitem_a = from_item;
 	filter->sceneitem_b = to_item;
 
-	//Create wrapper scenes duplicating the full parent scene: Wrapper A has from_item visible; Wrapper B has to_item visible */
+	//Create wrapper scenes duplicating the full parent scene: Wrapper A has from_item visible; Wrapper B has to_item visible
 	filter->wrapper_scene_a = create_wrapper_scene(parent, filter, from_item);
 	filter->wrapper_scene_b = create_wrapper_scene(parent, filter, to_item);
 
@@ -204,7 +170,8 @@ static void on_item_visible(void *data, calldata_t *calldata)
 	bool visible = calldata_bool(calldata, "visible");
 	if (!item) return;
 
-	if (!is_item_managed(filter, item)) return;
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (is_source_excluded(filter, source)) return;
 
 	if (visible)
 	{
@@ -220,34 +187,6 @@ static void on_item_visible(void *data, calldata_t *calldata)
 	{
 		if (item == filter->sceneitem_a) return;
 		if (item == filter->current_active_item && !filter->transitioning) filter->current_active_item = NULL;		
-	}
-}
-
-static void on_item_add(void *data, calldata_t *calldata)
-{
-	struct move_source_switcher_info *filter = data;
-	obs_sceneitem_t *item = (obs_sceneitem_t *)calldata_ptr(calldata, "item");
-	if (!item) return;
-
-	obs_source_t *source = obs_sceneitem_get_source(item);
-	if (!source) return;
-
-	const char *name = obs_source_get_name(source);
-	if (!name || !strlen(name)) return;
-
-	obs_data_t *settings = obs_source_get_settings(filter->filter_source);
-	bool checked = obs_data_get_bool(settings, name);
-	obs_data_release(settings);
-
-	bool managed = (filter->mode == FILTER_MODE_INCLUDE) ? checked : !checked;
-	if (managed)
-	{
-		int64_t id = obs_sceneitem_get_id(item);
-		for (size_t i = 0; i < filter->managed_item_ids.num; i++)
-		{
-			if (filter->managed_item_ids.array[i] == id) return;
-		}
-		da_push_back(filter->managed_item_ids, &id);
 	}
 }
 
@@ -269,38 +208,6 @@ static void on_item_remove(void *data, calldata_t *calldata)
 			clean_wrapper_scenes(filter);
 			filter->transitioning = false;
 		}
-	}
-
-	int64_t id = obs_sceneitem_get_id(item);
-	for (size_t i = 0; i < filter->managed_item_ids.num; i++)
-	{
-		if (filter->managed_item_ids.array[i] == id)
-		{
-			da_erase(filter->managed_item_ids, i);
-			break;
-		}
-	}
-}
-
-static void on_source_rename(void *data, calldata_t *calldata)
-{
-	struct move_source_switcher_info *filter = data;
-	const char *new_name = calldata_string(calldata, "new_name");
-	const char *prev_name = calldata_string(calldata, "prev_name");
-	if (!new_name || !prev_name || !filter->filter_source)
-		return;
-
-	/* Save and persist updated settings on source rename without recursive source_update */
-	obs_data_t *settings = obs_source_get_settings(filter->filter_source);
-	if (settings)
-	{
-		if (obs_data_has_user_value(settings, prev_name))
-		{
-			bool val = obs_data_get_bool(settings, prev_name);
-			obs_data_erase(settings, prev_name);
-			obs_data_set_bool(settings, new_name, val);
-		}
-		obs_data_release(settings);
 	}
 }
 
@@ -327,7 +234,6 @@ static void disconnect_parent_signals(struct move_source_switcher_info *filter)
 {
 	if (filter->connected_scene_signals)
 	{
-		signal_handler_disconnect(filter->connected_scene_signals, "item_add", on_item_add, filter);
 		signal_handler_disconnect(filter->connected_scene_signals, "item_visible", on_item_visible, filter);
 		signal_handler_disconnect(filter->connected_scene_signals, "item_remove", on_item_remove, filter);
 		signal_handler_disconnect(filter->connected_scene_signals, "remove", on_parent_destroy, filter);
@@ -352,7 +258,6 @@ static void connect_parent_signals(struct move_source_switcher_info *filter)
 
 	if (sh)
 	{
-		signal_handler_connect(sh, "item_add", on_item_add, filter);
 		signal_handler_connect(sh, "item_visible", on_item_visible, filter);
 		signal_handler_connect(sh, "item_remove", on_item_remove, filter);
 		signal_handler_connect(sh, "remove", on_parent_destroy, filter);
@@ -361,49 +266,18 @@ static void connect_parent_signals(struct move_source_switcher_info *filter)
 	}
 }
 
-static bool cache_managed_items(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
-{
-	UNUSED_PARAMETER(scene);
-	struct move_source_switcher_info *filter = param;
-	obs_source_t *source = obs_sceneitem_get_source(item);
-	if (!source) return true;
-	const char *name = obs_source_get_name(source);
-	if (!name || !strlen(name)) return true;
-
-	obs_data_t *settings = obs_source_get_settings(filter->filter_source);
-	bool checked = obs_data_get_bool(settings, name);
-	obs_data_release(settings);
-
-	bool managed = (filter->mode == FILTER_MODE_INCLUDE) ? checked : !checked;
-	if (managed)
-	{
-		int64_t id = obs_sceneitem_get_id(item);
-		da_push_back(filter->managed_item_ids, &id);
-	}
-	return true;
-}
-
-struct check_single_visibility_data
-{
-	struct move_source_switcher_info *filter;
-	bool found_active;
-};
-
 static bool init_active_item(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
 {
 	UNUSED_PARAMETER(scene);
-	struct check_single_visibility_data *csv = param;
-	struct move_source_switcher_info *filter = csv->filter;
+	struct move_source_switcher_info *filter = param;
 
-	if (!is_item_managed(filter, item)) return true;
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (is_source_excluded(filter, source)) return true;
 
 	if (obs_sceneitem_visible(item))
 	{
-		if (!csv->found_active)
-		{
-			csv->found_active = true;
-			filter->current_active_item = item;
-		}
+		filter->current_active_item = item;
+		return false;
 	}
 	return true;
 }
@@ -437,8 +311,7 @@ static void on_filter_enable(void *data, calldata_t *calldata)
 			if (!scene) scene = obs_group_from_source(parent);
 			if (scene)
 			{
-				struct check_single_visibility_data csv = {filter, false};
-				obs_scene_enum_items(scene, init_active_item, &csv);
+				obs_scene_enum_items(scene, init_active_item, filter);
 			}
 		}
 	}
@@ -448,11 +321,9 @@ static void *move_source_switcher_create(obs_data_t *settings, obs_source_t *sou
 {
 	struct move_source_switcher_info *filter = bzalloc(sizeof(struct move_source_switcher_info));
 	filter->filter_source = source;
-	da_init(filter->managed_item_ids);
 
 	filter->move_transition = obs_source_create_private("move_transition", "internal_move_switcher", settings);
 
-	signal_handler_connect(obs_get_signal_handler(), "source_rename", on_source_rename, filter);
 	signal_handler_connect(obs_source_get_signal_handler(source), "enable", on_filter_enable, filter);
 	connect_parent_signals(filter);
 
@@ -463,7 +334,6 @@ static void *move_source_switcher_create(obs_data_t *settings, obs_source_t *sou
 static void move_source_switcher_destroy(void *data)
 {
 	struct move_source_switcher_info *filter = data;
-	signal_handler_disconnect(obs_get_signal_handler(), "source_rename", on_source_rename, filter);
 	if (filter->filter_source)
 	{
 		signal_handler_disconnect(obs_source_get_signal_handler(filter->filter_source), "enable", on_filter_enable, filter);
@@ -479,7 +349,9 @@ static void move_source_switcher_destroy(void *data)
 	}
 
 	clean_wrapper_scenes(filter);
-	free_managed_sources(filter);
+
+	dstr_free_tokens(filter->excluded_sources);
+	filter->excluded_sources = NULL;
 
 	bfree(filter);
 }
@@ -549,15 +421,37 @@ static void move_source_switcher_tick(void *data, float seconds)
 static void move_source_switcher_update(void *data, obs_data_t *settings)
 {
 	struct move_source_switcher_info *filter = data;
-	filter->mode = (enum filter_mode)obs_data_get_int(settings, "filter_mode");
 	filter->duration = (uint32_t)obs_data_get_int(settings, S_DURATION);
+
+	dstr_free_tokens(filter->excluded_sources);
+	filter->excluded_sources = NULL;
+
+	const char *excluded_str = obs_data_get_string(settings, "excluded_sources");
+	if (excluded_str && *excluded_str)
+	{
+		char *copy = bstrdup(excluded_str);
+		for (char *c = copy; *c; c++)
+		{
+			if (*c == '\n' || *c == '\r') *c = ',';
+		}
+		filter->excluded_sources = dstr_split(copy, ',', false);
+		bfree(copy);
+
+		for (char **p = filter->excluded_sources; p && *p; p++)
+		{
+			char *str = *p;
+			while (*str == ' ' || *str == '\t') str++;
+			if (str != *p) memmove(*p, str, strlen(str) + 1);
+			size_t len = strlen(*p);
+			while (len > 0 && ((*p)[len - 1] == ' ' || (*p)[len - 1] == '\t')) (*p)[--len] = '\0';
+		}
+	}
 
 	if (filter->move_transition) obs_source_update(filter->move_transition, settings);
 	else filter->move_transition = obs_source_create_private("move_transition", "internal_move_switcher", settings);
 	
 	connect_parent_signals(filter);
 
-	free_managed_sources(filter);
 	obs_source_t *parent = obs_filter_get_parent(filter->filter_source);
 	if (parent)
 	{
@@ -565,27 +459,12 @@ static void move_source_switcher_update(void *data, obs_data_t *settings)
 		if (!scene) scene = obs_group_from_source(parent);
 		if (scene)
 		{
-			obs_scene_enum_items(scene, cache_managed_items, filter);
 			if (!filter->transitioning && !filter->current_active_item)
 			{
-				struct check_single_visibility_data csv = {filter, false};
-				obs_scene_enum_items(scene, init_active_item, &csv);
+				obs_scene_enum_items(scene, init_active_item, filter);
 			}
 		}
 	}
-}
-
-struct item_list
-{
-	DARRAY(obs_sceneitem_t *) items;
-};
-
-static bool collect_scene_items(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
-{
-	UNUSED_PARAMETER(scene);
-	struct item_list *list = param;
-	da_push_back(list->items, &item);
-	return true;
 }
 
 static obs_properties_t *move_source_switcher_properties(void *data)
@@ -604,25 +483,7 @@ static obs_properties_t *move_source_switcher_properties(void *data)
 		return ppts;
 	}
 
-	obs_property_t *mode_list = obs_properties_add_list(ppts, "filter_mode", obs_module_text("FilterMode"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(mode_list, obs_module_text("FilterMode.Include"), FILTER_MODE_INCLUDE);
-	obs_property_list_add_int(mode_list, obs_module_text("FilterMode.Exclude"), FILTER_MODE_EXCLUDE);
-
-	obs_properties_t *sources_group = obs_properties_create();
-	struct item_list list;
-	da_init(list.items);
-	obs_scene_enum_items(scene, collect_scene_items, &list);
-	for (size_t i = list.items.num; i > 0; i--)
-	{
-		obs_sceneitem_t *item = list.items.array[i - 1];
-		obs_source_t *source = obs_sceneitem_get_source(item);
-		if (!source) continue;
-		const char *name = obs_source_get_name(source);
-		if (!name || !strlen(name)) continue;
-		obs_properties_add_bool(sources_group, name, name);
-	}
-	da_free(list.items);
-	obs_properties_add_group(ppts, "managed_sources", obs_module_text("ManagedSources"), OBS_GROUP_NORMAL, sources_group);
+	obs_properties_add_text(ppts, "excluded_sources", obs_module_text("ExcludedSources"), OBS_TEXT_MULTILINE);
 
 	obs_property_t *p = obs_properties_add_int(ppts, S_DURATION, obs_module_text("Duration"), 0, 10000, 50);
 	obs_property_int_set_suffix(p, "ms");
@@ -690,7 +551,7 @@ static obs_properties_t *move_source_switcher_properties(void *data)
 
 static void move_source_switcher_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_int(settings, "filter_mode", FILTER_MODE_EXCLUDE);
+	obs_data_set_default_string(settings, "excluded_sources", "");
 	obs_data_set_default_int(settings, S_DURATION, 600);
 	move_defaults(settings);
 	obs_data_set_default_bool(settings, S_NAME_PART_MATCH, true);

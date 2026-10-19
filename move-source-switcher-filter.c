@@ -57,26 +57,6 @@ static inline bool is_source_excluded(struct move_source_switcher_info *filter, 
 	return false;
 }
 
-struct find_sceneitem_index_data
-{
-	obs_sceneitem_t *target_item;
-	int target_index;  //sceneitem index result
-	int current_index;  //used for temporary storage while iterating
-};
-
-static bool find_sceneitem_index(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
-{
-	UNUSED_PARAMETER(scene);
-	struct find_sceneitem_index_data *data = param;
-	if (item == data->target_item)
-	{
-		data->target_index = data->current_index;
-		return false;
-	}
-	data->current_index++;
-	return true;
-}
-
 struct adjust_sceneitem_visibility_data
 {
 	struct move_source_switcher_info *filter;
@@ -112,21 +92,10 @@ static obs_source_t *create_wrapper_scene(obs_source_t *parent_source, struct mo
 	obs_scene_t *dup_scene = obs_scene_duplicate(parent_scene, "switcher_wrapper", OBS_SCENE_DUP_PRIVATE_REFS);
 	if (!dup_scene) return NULL;
 
-	struct find_sceneitem_index_data find_data =
-	{
-		.target_item = active_item,
-		.target_index = -1,
-		.current_index = 0,
-	};
-	if (active_item)
-	{
-		obs_scene_enum_items(parent_scene, find_sceneitem_index, &find_data);
-	}
-
 	struct adjust_sceneitem_visibility_data data =
 	{
 		.filter = filter,
-		.target_index = find_data.target_index,
+		.target_index = active_item ? obs_sceneitem_get_order_position(active_item) : -1,
 		.current_index = 0,
 	};
 	obs_scene_enum_items(dup_scene, adjust_wrapper_scene_item_visibility, &data);
